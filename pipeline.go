@@ -16,6 +16,7 @@ import (
 	"github.com/hscells/groove/query"
 	"github.com/hscells/groove/rank"
 	"github.com/hscells/groove/stats"
+	"github.com/hscells/headway"
 	"github.com/hscells/transmute"
 	"github.com/hscells/trecresults"
 	"github.com/peterbourgon/diskv"
@@ -25,6 +26,7 @@ import (
 	"path"
 	"sort"
 	"strconv"
+	"time"
 )
 
 // Pipeline contains all the information for executing a pipeline for query analysis.
@@ -143,6 +145,7 @@ func NewGroovePipeline(qs query.QueriesSource, ss stats.StatisticsSource, compon
 }
 
 // Execute runs a groove pipeline for a particular directory of queries.
+//noinspection GoNilness
 func (p Pipeline) Execute(c chan pipeline.Result) {
 	defer close(c)
 	log.Println("starting groove pipeline...")
@@ -293,6 +296,15 @@ func (p Pipeline) Execute(c chan pipeline.Result) {
 			}
 		}
 
+		var hw *headway.Client
+		loghw := false
+		if len(p.CLF.HeadwayServer) > 0 {
+			hw = headway.NewClient(p.CLF.HeadwayServer, fmt.Sprintf("@harry groove pipeline [#%d]", time.Now().Unix()))
+			if hw != nil {
+				loghw = true
+			}
+		}
+
 		if (len(p.OutputTrec.Path) > 0 || len(p.EvaluationFormatters.EvaluationFormatters) > 0) && p.CLF.CLF {
 			// Store the measurements to be output later.
 
@@ -316,7 +328,7 @@ func (p Pipeline) Execute(c chan pipeline.Result) {
 			f.Close()
 
 			measurements := make(map[string]map[string]float64)
-			for _, q := range measurementQueries {
+			for i, q := range measurementQueries {
 				if _, ok := r.Results[q.Topic]; ok {
 					log.Printf("already completed topic %v, so skipping it\n", q.Topic)
 					continue
@@ -324,11 +336,23 @@ func (p Pipeline) Execute(c chan pipeline.Result) {
 				log.Printf("starting topic %v\n", q.Topic)
 				results, err := rank.CLF(q, p.StatisticsSource.(stats.EntrezStatisticsSource), p.CLF)
 				if err != nil {
+					if loghw {
+						err = hw.Send(float64(i), float64(len(measurementQueries)), err.Error())
+						if err != nil {
+							log.Println(err)
+						}
+					}
 					c <- pipeline.Result{
 						Error: err,
 						Type:  pipeline.Error,
 					}
 					return
+				}
+				if loghw {
+					err = hw.Send(float64(i), float64(len(measurementQueries)), fmt.Sprintf("[measurement] topic %s", q.Topic))
+					if err != nil {
+						log.Println(err)
+					}
 				}
 				// Set the evaluation results.
 				if len(p.Evaluations) > 0 {
@@ -351,6 +375,9 @@ func (p Pipeline) Execute(c chan pipeline.Result) {
 				}
 
 				log.Printf("completed topic %v\n", q.Topic)
+			}
+			if loghw {
+				_ = hw.Send(float64(len(measurementQueries)), float64(len(measurementQueries)), "[measurement] done!")
 			}
 
 		} else if len(p.OutputTrec.Path) > 0 || len(p.EvaluationFormatters.EvaluationFormatters) > 0 {
@@ -418,6 +445,9 @@ func (p Pipeline) Execute(c chan pipeline.Result) {
 					//trecResults := docIds.Results(query, query.Name)
 					trecResults, err := p.StatisticsSource.Execute(query, p.StatisticsSource.SearchOptions())
 					if err != nil {
+						if loghw {
+							_ = hw.Send(float64(i), float64(len(measurementQueries)), err.Error())
+						}
 						panic(err)
 					}
 

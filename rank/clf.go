@@ -14,6 +14,7 @@ import (
 	"github.com/hscells/groove/learning"
 	"github.com/hscells/groove/pipeline"
 	"github.com/hscells/groove/stats"
+	"github.com/hscells/headway"
 	"github.com/hscells/merging"
 	"github.com/hscells/quickumlsrest"
 	"github.com/hscells/transmute"
@@ -22,12 +23,13 @@ import (
 	"github.com/reiver/go-porterstemmer"
 	"gopkg.in/jdkato/prose.v2"
 	"io/ioutil"
+	"log"
+	"math/rand"
 	"os"
 	"path"
 	"sort"
 	"strconv"
 	"strings"
-	"sync"
 	"time"
 )
 
@@ -479,7 +481,8 @@ func writeResults(list trecresults.ResultList, dir string) error {
 	return nil
 }
 
-func clfVariations(query cqr.CommonQueryRepresentation, topic string, idealPosting *Posting, e stats.EntrezStatisticsSource, options CLFOptions) error {
+func clfVariations(query cqr.CommonQueryRepresentation, topic string, e stats.EntrezStatisticsSource, options CLFOptions) error {
+	learning.ComputeFeatures = false
 	candidates, err := learning.Variations(learning.CandidateQuery{
 		TransformationID: -1,
 		Topic:            topic,
@@ -495,13 +498,19 @@ func clfVariations(query cqr.CommonQueryRepresentation, topic string, idealPosti
 		return err
 	}
 
-	wg := new(sync.WaitGroup)
+	var hw *headway.Client
+	if len(options.HeadwayServer) > 0 {
+		log.Println("connecting to headway server...")
+		hw = headway.NewClient(options.HeadwayServer, fmt.Sprintf("@harry topic [%s]", topic))
+	}
+	//wg := new(sync.WaitGroup)
 
-	//cd, err := os.UserCacheDir()
-	//if err != nil {
-	//	return err
-	//}
-	//indexPath := path.Join(cd, "groove_rank_variations")
+	cd, err := os.UserCacheDir()
+	if err != nil {
+		return err
+	}
+	cachePath := path.Join(cd, "groove_query_cache")
+	fileCache := combinator.NewFileQueryCache(cachePath)
 
 	p := options.VariationsOutput
 	err = os.MkdirAll(path.Join(p, topic), 0777)
@@ -513,22 +522,10 @@ func clfVariations(query cqr.CommonQueryRepresentation, topic string, idealPosti
 		return err
 	}
 
-	//rand.Shuffle(len(candidates), func(i, j int) {
-	//	candidates[i], candidates[j] = candidates[j], candidates[i]
-	//})
-	//
-	//if len(candidates) > 100 {
-	//	candidates = candidates[:100]
-	//}
-
+	fmt.Println("filtering candidates by size")
+	var filteredCandidates []learning.CandidateQuery
+	numRet := make(map[uint32]float64)
 	for i, candidate := range candidates {
-		fmt.Printf("[%s] variation %d/%d\n", topic, i+1, len(candidates))
-
-		// String-ify the query.
-		s, err := transmute.CompileCqr2PubMed(candidate.Query)
-		if err != nil {
-			return err
-		}
 	r:
 		// Skip this candidate if it retrieves more than the original query.
 		n, err := e.RetrievalSize(candidate.Query)
@@ -536,21 +533,58 @@ func clfVariations(query cqr.CommonQueryRepresentation, topic string, idealPosti
 			fmt.Println(err)
 			goto r
 		}
-		if n < N/2 || n >= N || n == 0 {
-			fmt.Printf("skipping variation %d, retrieved documents out of bounds\n", i+1)
-			fmt.Println(s)
+		if n >= N || n == 0 {
+			fmt.Printf(" - skipping variation %d, retrieved documents out of bounds\n", i+1)
 			continue
+		}
+		//if n > 50000 {
+		//	fmt.Printf(" - skipping variation %d, retrieved too many documents\n", i+1)
+		//	continue
+		//}
+		// String-ify the query.
+		s, err := transmute.CompileCqr2PubMed(candidate.Query)
+		if err != nil {
+			return err
+		}
+		numRet[hash(s)] = n
+
+		filteredCandidates = append(filteredCandidates, candidate)
+	}
+
+	fmt.Println("randomly filtering remaining candidates to less than 50")
+	rand.Shuffle(len(filteredCandidates), func(i, j int) {
+		filteredCandidates[i], filteredCandidates[j] = filteredCandidates[j], filteredCandidates[i]
+	})
+	if len(filteredCandidates) > 50 {
+		filteredCandidates = filteredCandidates[:50]
+	}
+
+	for i, candidate := range filteredCandidates {
+		fmt.Printf("[%s] variation %d/%d\n", topic, i+1, len(filteredCandidates))
+
+		// String-ify the query.
+		s, err := transmute.CompileCqr2PubMed(candidate.Query)
+		if err != nil {
+			return err
 		}
 	s:
 		// Obtain list of pmids.
-		pmids, err := e.Search(s)
+		tree, _, err := combinator.NewLogicalTree(pipeline.NewQuery(candidate.Topic, candidate.Topic, candidate.Query), e, fileCache)
 		if err != nil {
+			_ = hw.Send(float64(i), float64(len(filteredCandidates)), err.Error())
 			fmt.Println(err)
 			goto s
 		}
+		pmids := tree.Documents(fileCache)
+		//pmids, err := e.Search(s)
+		//if err != nil {
+		//	fmt.Println(err)
+		//	goto s
+		//}
+
 		items := make(merging.Items, len(pmids))
 		for i, pmid := range pmids {
-			items[i] = merging.Item{Id: strconv.Itoa(pmid), Score: 0}
+			items[i] = merging.Item{Id: strconv.Itoa(int(pmid)), Score: 0}
 		}
 		// Create posting list for query.
 		//f:
@@ -605,6 +639,8 @@ func clfVariations(query cqr.CommonQueryRepresentation, topic string, idealPosti
 			return err
 		}
 
+		n := numRet[hash(s)]
+
 		// Write the transformation ID.
 		f3, err := os.OpenFile(path.Join(p, topic, strconv.Itoa(int(hash(s)))+".ret"), os.O_CREATE|os.O_WRONLY, 0664)
 		if err != nil {
@@ -618,8 +654,20 @@ func clfVariations(query cqr.CommonQueryRepresentation, topic string, idealPosti
 		if err != nil {
 			return err
 		}
+		if len(options.HeadwayServer) > 0 {
+			err = hw.Send(float64(i), float64(len(filteredCandidates)), fmt.Sprintf("retrieved: %f", n))
+			if err != nil {
+				log.Println(err)
+			}
+		}
 	}
-	wg.Wait()
+	if len(options.HeadwayServer) > 0 {
+		err = hw.Send(float64(len(filteredCandidates)), float64(len(filteredCandidates)), fmt.Sprintf("done!"))
+		if err != nil {
+			log.Println(err)
+		}
+	}
+	//wg.Wait()
 	return nil
 }
 
@@ -668,6 +716,8 @@ type CLFOptions struct {
 	quickumlscache   quickumlsrest.Cache
 
 	Titles string `json:"titles"`
+
+	HeadwayServer string `json:"headway_server"`
 }
 
 func (o CLFOptions) SetVariationOptions(vector cui2vec.Embeddings, mapping cui2vec.Mapping, cache quickumlsrest.Cache) CLFOptions {
@@ -685,20 +735,22 @@ func CLF(query pipeline.Query, e stats.EntrezStatisticsSource, options CLFOption
 		return nil, err
 	}
 	indexPath := path.Join(cd, "groove_rank")
-	idealIndexPath := path.Join(cd, "groove_rank_ideal")
+	//idealIndexPath := path.Join(cd, "groove_rank_ideal")
 
 	var pmids []int
-	b, err := ioutil.ReadFile(path.Join(options.PMIDS, query.Topic))
-	if err != nil {
-		return nil, err
-	}
-	s := bufio.NewScanner(bytes.NewBuffer(b))
-	for s.Scan() {
-		pmid, err := strconv.Atoi(s.Text())
+	if !options.CLFVariations {
+		b, err := ioutil.ReadFile(path.Join(options.PMIDS, query.Topic))
 		if err != nil {
 			return nil, err
 		}
-		pmids = append(pmids, pmid)
+		s := bufio.NewScanner(bytes.NewBuffer(b))
+		for s.Scan() {
+			pmid, err := strconv.Atoi(s.Text())
+			if err != nil {
+				return nil, err
+			}
+			pmids = append(pmids, pmid)
+		}
 	}
 
 	if options.QueryExpansion {
@@ -745,40 +797,27 @@ func CLF(query pipeline.Query, e stats.EntrezStatisticsSource, options CLFOption
 	}
 
 	if options.CLFVariations {
-		f, err := os.OpenFile(options.Qrels, os.O_RDONLY, 0664)
-		if err != nil {
-			return nil, err
-		}
-		qrels, err := trecresults.QrelsFromReader(f)
-		if err != nil {
-			return nil, err
-		}
-		rels := qrels.Qrels[query.Topic]
-		var pmidsIdeal []int
-		for _, rel := range rels {
-			if rel.Score > 0 {
-				i, err := strconv.Atoi(rel.DocId)
-				if err != nil {
-					return nil, err
-				}
-				pmidsIdeal = append(pmids, i)
-			}
-		}
-		idealPosting, err := newPostingFromPMIDS(pmidsIdeal, query.Topic, idealIndexPath, e)
-		if err != nil {
-			return nil, err
-		}
-
 		if _, err := os.Stat(path.Join(options.VariationsOutput, query.Topic)); os.IsNotExist(err) {
-			res, err := e.Execute(query, e.SearchOptions())
-			if err != nil {
-				return nil, err
-			}
-			err = writeResults(res, path.Join(options.VariationsOutput, "orig", query.Topic))
-			if err != nil {
-				return nil, err
-			}
-			return nil, clfVariations(query.Query, query.Topic, idealPosting, e, options)
+			//res, err := e.Execute(query, e.SearchOptions())
+			//if err != nil {
+			//	return nil, err
+			//}
+			//cd, err := os.UserCacheDir()
+			//if err != nil {
+			//	return nil, err
+			//}
+			//cachePath := path.Join(cd, "groove_query_cache")
+			//fileCache := combinator.NewFileQueryCache(cachePath)
+			//tree, _, err := combinator.NewLogicalTree(query, e, fileCache)
+			//if err != nil {
+			//	return nil, err
+			//}
+			//
+			//err = writeResults(tree.Documents(fileCache).Results(query, "o"), path.Join(options.VariationsOutput, "orig", query.Topic))
+			//if err != nil {
+			//	return nil, err
+			//}
+			return nil, clfVariations(query.Query, query.Topic, e, options)
 		} else {
 			fmt.Printf("skipping topic %s, already exists\n", query.Topic)
 		}
